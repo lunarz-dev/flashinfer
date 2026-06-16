@@ -202,6 +202,19 @@ def parse_attention_args(line, parser):
         default=False,
         help="Use random actual sequence lengths for the query and key and value. Random values are generated between 1 and maximum sequence length. If False, use maximum sequence length.",
     )
+    parser.add_argument(
+        "--mla_is_var_seq",
+        choices=["true", "false", "auto"],
+        default=None,
+        help=(
+            "MLA-only: control the is_var_seq argument passed to "
+            "trtllm_batch_decode_with_kv_cache_mla, which selects the var-seq vs. "
+            "persistent scheduler (is_persistent = not is_var_seq). "
+            "'true'/'false' force the value; 'auto' resolves to --random_actual_seq_len. "
+            "If unset (default), is_var_seq is not passed and the API default (True) "
+            "is used, preserving existing behavior and perf baselines."
+        ),
+    )
 
     args = parser.parse_args(line)
 
@@ -2107,6 +2120,21 @@ def testBatchMLAPagedAttentionWrapper(args):
     causal = False  # False for MLA
     run_refcheck = args.refcheck
 
+    # Resolve the MLA is_var_seq override (selects var-seq vs. persistent
+    # scheduler). None => do not pass is_var_seq to the API, keeping its default
+    # so existing cases and perf baselines are unchanged.
+    mla_is_var_seq_arg = getattr(args, "mla_is_var_seq", None)
+    if mla_is_var_seq_arg is None:
+        resolved_is_var_seq = None
+    elif mla_is_var_seq_arg == "auto":
+        resolved_is_var_seq = args.random_actual_seq_len
+    else:
+        resolved_is_var_seq = mla_is_var_seq_arg == "true"
+    # Only forwarded to the direct trtllm API when explicitly resolved.
+    mla_api_extra_kwargs = (
+        {} if resolved_is_var_seq is None else {"is_var_seq": resolved_is_var_seq}
+    )
+
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
     if "fa2" in backends:
@@ -2344,6 +2372,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 max_seq_len=s_kv,
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
+                **mla_api_extra_kwargs,
             ).squeeze(1)
         elif backend == "cute-dsl":
             return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
@@ -2359,6 +2388,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
                 backend="cute-dsl",
+                **mla_api_extra_kwargs,
             ).squeeze(1)
         else:
             print(f"[ERROR] Unsupported backend: {backend}")
@@ -2497,6 +2527,10 @@ def testBatchMLAPagedAttentionWrapper(args):
                 cur_res["kv_dtype"] = kv_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_kv
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
+                # Leave empty (null) when not explicitly overridden so legacy
+                # var-seq rows keep matching historical null baselines.
+                if resolved_is_var_seq is not None:
+                    cur_res["is_var_seq"] = resolved_is_var_seq
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
