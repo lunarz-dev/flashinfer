@@ -215,6 +215,17 @@ def parse_attention_args(line, parser):
             "is used, preserving existing behavior and perf baselines."
         ),
     )
+    parser.add_argument(
+        "--mla_cute_dsl_impl",
+        choices=["auto", "monolithic", "modular"],
+        default=None,
+        help=(
+            "MLA-only: force the cute_dsl_impl argument of "
+            "trtllm_batch_decode_with_kv_cache_mla (cute-dsl backend). "
+            "If unset, cute_dsl_impl is not passed and the API default ('auto', "
+            "which picks monolithic) is used."
+        ),
+    )
 
     args = parser.parse_args(line)
 
@@ -2134,6 +2145,12 @@ def testBatchMLAPagedAttentionWrapper(args):
     mla_api_extra_kwargs = (
         {} if resolved_is_var_seq is None else {"is_var_seq": resolved_is_var_seq}
     )
+    # cute-dsl-only: force monolithic vs modular impl. The PR#3132 regression
+    # lives in the modular path, so catching it requires cute_dsl_impl="modular".
+    mla_cute_dsl_impl = getattr(args, "mla_cute_dsl_impl", None)
+    cute_dsl_extra_kwargs = dict(mla_api_extra_kwargs)
+    if mla_cute_dsl_impl is not None:
+        cute_dsl_extra_kwargs["cute_dsl_impl"] = mla_cute_dsl_impl
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
@@ -2388,7 +2405,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
                 backend="cute-dsl",
-                **mla_api_extra_kwargs,
+                **cute_dsl_extra_kwargs,
             ).squeeze(1)
         else:
             print(f"[ERROR] Unsupported backend: {backend}")
