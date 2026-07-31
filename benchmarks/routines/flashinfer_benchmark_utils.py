@@ -70,6 +70,12 @@ output_column_dict = {
         "ep_size",
         "ep_rank",
     ],
+    "quantization": [
+        "global_scale",
+        "sf_layout",
+        "do_shuffle",
+        "sf_vec_size",
+    ],
     "general": [
         "refcheck",
         "no_cuda_graph",
@@ -87,6 +93,7 @@ full_output_columns = (
     + output_column_dict["attention"]
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
+    + output_column_dict["quantization"]
     + output_column_dict["general"]
 )
 
@@ -108,6 +115,9 @@ benchmark_apis = {
         "trtllm_fp8_block_scale_moe",
         "trtllm_fp8_per_tensor_scale_moe",
         "cutlass_fused_moe",
+    ],
+    "quantization": [
+        "nvfp4_quantize",
     ],
 }
 
@@ -283,6 +293,17 @@ routine_cc_to_supported_backends = {
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
         "12.0": [],
+    },
+    "nvfp4_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
     },
 }
 
