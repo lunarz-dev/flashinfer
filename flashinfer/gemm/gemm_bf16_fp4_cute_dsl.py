@@ -717,7 +717,7 @@ def _get_sm100_bf16_fp4_kernel(
         k,
         max_active_clusters=max_active_clusters,
         stream=stream,
-        options="--opt-level 3 --enable-tvm-ffi",
+        options="--opt-level 2 --enable-tvm-ffi",
     )
     _SM100_BF16_FP4_KERNEL_CACHE[cache_key] = compiled
     return compiled
