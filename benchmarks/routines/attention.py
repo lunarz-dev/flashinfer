@@ -1,3 +1,4 @@
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -421,6 +422,34 @@ def parse_attention_args(line, parser):
         help="Use random actual sequence lengths for the query and key and value. Random values are generated between 1 and maximum sequence length. If False, use maximum sequence length.",
     )
     parser.add_argument(
+        "--ragged_length_pattern",
+        choices=["all-active", "mixed-empty-kv"],
+        default="all-active",
+        help=(
+            "Ragged-prefill-only sequence-length pattern. 'all-active' keeps "
+            "every row non-empty; 'mixed-empty-kv' sets every fourth KV row "
+            "to length zero."
+        ),
+    )
+    parser.add_argument(
+        "--trtllm_cpu_seq_lens",
+        choices=["none", "provided"],
+        default="none",
+        help=(
+            "Ragged-prefill-only control for passing trusted CPU sequence-length "
+            "mirrors to the direct TRTLLM API."
+        ),
+    )
+    parser.add_argument(
+        "--measure_host_enqueue",
+        action="store_true",
+        default=False,
+        help=(
+            "Measure eager host call/enqueue latency instead of GPU execution "
+            "time. Requires --no_cuda_graph."
+        ),
+    )
+    parser.add_argument(
         "--autotune",
         action="store_true",
         default=False,
@@ -492,6 +521,31 @@ def sample_actual_seq_lens(max_seqlen, batch_size, device, random_actual_seq_len
             (batch_size, 1, 1, 1), max_seqlen, device=device, dtype=torch.int32
         )
     return actual_seq_lens
+
+
+def _bench_host_enqueue_time(
+    fn, dry_run_iters, repeat_iters, input_args=(), queued_work_fn=None
+):
+    """Measure whether a host call remains asynchronous behind queued GPU work."""
+
+    for _ in range(dry_run_iters):
+        torch.cuda.synchronize()
+        if queued_work_fn is not None:
+            queued_work_fn()
+        fn(*input_args)
+        torch.cuda.synchronize()
+
+    measured_times = []
+    for _ in range(repeat_iters):
+        torch.cuda.synchronize()
+        if queued_work_fn is not None:
+            queued_work_fn()
+        start_ns = time.perf_counter_ns()
+        fn(*input_args)
+        elapsed_ns = time.perf_counter_ns() - start_ns
+        torch.cuda.synchronize()
+        measured_times.append(elapsed_ns / 1e6)
+    return measured_times
 
 
 def generate_speculative_mask(batch_size, q_seq_len, device, mask_mode="causal"):
@@ -2247,6 +2301,10 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     # return_lse = not args.no_lse # TO-DO: Add support for this
     run_refcheck = args.refcheck
 
+    if args.measure_host_enqueue and is_cuda_graph_compatible:
+        print("[ERROR] --measure_host_enqueue requires --no_cuda_graph. Exiting.")
+        return res
+
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
     if "fa2" in backends:
@@ -2421,6 +2479,9 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         )
         actual_seq_lens_kv = torch.maximum(actual_seq_lens_kv, actual_seq_lens_q)
 
+    if args.ragged_length_pattern == "mixed-empty-kv":
+        actual_seq_lens_kv[::4] = 0
+
     avg_seq_len_q = actual_seq_lens_q.sum().item() // batch_size
     avg_seq_len_kv = actual_seq_lens_kv.sum().item() // batch_size
     if args.verbose >= 1:
@@ -2463,6 +2524,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     ## The following are for BatchPrefillWithRaggedKVCacheWrapper
     actual_seq_lens_q_device = actual_seq_lens_q.to(device)
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
+    actual_seq_lens_q_cpu = actual_seq_lens_q.reshape(-1).contiguous()
+    actual_seq_lens_kv_cpu = actual_seq_lens_kv.reshape(-1).contiguous()
 
     q_indptr = (
         torch.cat(
@@ -2749,6 +2812,12 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             _q_scale = q_scale if q_scale is not None else 1.0
             _k_scale = k_scale if k_scale is not None else 1.0
             _v_scale = v_scale if v_scale is not None else 1.0
+            cpu_seq_lens_kwargs = {}
+            if args.trtllm_cpu_seq_lens == "provided":
+                cpu_seq_lens_kwargs = {
+                    "q_seq_lens_cpu": actual_seq_lens_q_cpu,
+                    "kv_seq_lens_cpu": actual_seq_lens_kv_cpu,
+                }
             return flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 query=q,
                 key=k,
@@ -2768,6 +2837,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 is_causal=causal,
                 return_lse=True,
                 out=out,
+                **cpu_seq_lens_kwargs,
             )[0]
         elif backend == "trtllm-fmha-v2":
             _q_scale = q_scale if q_scale is not None else 1.0
@@ -2851,21 +2921,26 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 out_arg,
             )
 
-        backend_times[cur_backend] = bench_gpu_time(
-            fn=run_timed_backend,
-            dry_run_iters=args.dry_run_iters,
-            repeat_iters=args.num_iters,
-            sleep_after_run=True,
-            enable_cupti=args.use_cupti,
-            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
-            cold_l2_cache=True,
-            input_args=(
-                q,
-                k,
-                v,
-                runtime_out,
-            ),
-        )
+        timing_args = (q, k, v, runtime_out)
+        if args.measure_host_enqueue:
+            backend_times[cur_backend] = _bench_host_enqueue_time(
+                fn=run_timed_backend,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
+                input_args=timing_args,
+                queued_work_fn=workspace_buffer.zero_,
+            )
+        else:
+            backend_times[cur_backend] = bench_gpu_time(
+                fn=run_timed_backend,
+                dry_run_iters=args.dry_run_iters,
+                repeat_iters=args.num_iters,
+                sleep_after_run=True,
+                enable_cupti=args.use_cupti,
+                use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
+                cold_l2_cache=True,
+                input_args=timing_args,
+            )
 
     # Perform reference check
     tested_backends = list(outputs.keys())
@@ -3012,6 +3087,11 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 cur_res["out_dtype"] = out_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_q
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
+                cur_res["ragged_length_pattern"] = args.ragged_length_pattern
+                cur_res["trtllm_cpu_seq_lens"] = args.trtllm_cpu_seq_lens
+                cur_res["metric_scope"] = (
+                    "host_enqueue" if args.measure_host_enqueue else "gpu_execution"
+                )
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
